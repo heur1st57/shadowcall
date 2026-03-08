@@ -5,7 +5,10 @@
 #include <compare>
 #include <cstddef>
 #include <cstdint>
+#include <fstream>
 #include <string>
+#include <unordered_map>
+#include <vector>
 #include <windows.h>
 
 namespace shadow {
@@ -55,7 +58,7 @@ namespace shadow {
             }
 
             template <typename Ret = address_t>
-            auto offset(const std::ptrdiff_t offset) const -> Ret {
+            auto offset(const std::size_t offset) const -> Ret {
                 return Ret(_address + offset);
             }
 
@@ -110,6 +113,10 @@ namespace shadow {
                 return hash;
             }
 
+            constexpr auto fnv1a64(const char* str) -> fnv1a64_t {
+                return fnv1a64(str, strlen(str));
+            }
+
             constexpr auto fnv1a64(const std::string& str) -> fnv1a64_t {
                 return fnv1a64(str.data(), str.length());
             }
@@ -119,8 +126,7 @@ namespace shadow {
             }
         } // namespace hash
 
-        namespace win
-        {
+        namespace win {
             struct list_entry_t {
                 list_entry_t* flink;
                 list_entry_t* blink;
@@ -293,127 +299,135 @@ namespace shadow {
                 std::uint16_t number_of_linenumbers;
                 std::uint32_t characteristics;
             };
-        }
 
-        inline auto wstr_to_str(const std::wstring& data) -> std::string {
-            if (data.empty())
-                return {};
+            struct large_integer_t {
+                union {
+                    struct {
+                        std::uint32_t low_part;
+                        std::int32_t high_part;
+                    };
+                    std::int64_t quad_part;
+                };
+            };
 
-            const int required_length = WideCharToMultiByte(
-                CP_UTF8,
-                0,
-                &data[0],
-                static_cast<int>(data.size()),
-                nullptr,
-                0,
-                nullptr,
-                nullptr);
+            constexpr std::int32_t kSectionAllAccess = 0x000F001F;
+            constexpr std::int32_t kPageExecuteReadWrite = 0x40;
+            constexpr std::int32_t kSecCommit = 0x08000000;
+            constexpr std::int32_t kPageReadWrite = 0x4;
+            constexpr std::int32_t kSecNoChange = 0x00400000;
+            constexpr std::int32_t kPageExecuteRead = 0x20;
 
-            std::string result = {};
-            result.resize(required_length);
-            WideCharToMultiByte(
-                CP_UTF8,
-                0,
-                &data[0],
-                static_cast<int>(data.size()),
-                &result[0],
-                required_length,
-                nullptr,
-                nullptr);
+            enum class eSectionInherit {
+                kViewShare = 1,
+                kViewUnmap = 2
+            };
 
-            return result;
-        }
+            template <typename class_type, typename field_type>
+            auto containing_record(field_type* field_addr, field_type class_type::* member_ptr) -> class_type* {
+                if (!field_addr) {
+                    return nullptr;
+                }
 
-        inline auto wstr_to_str(const std::wstring_view data) -> std::string {
-            if (data.empty())
-                return {};
+                alignas(class_type) char dummy_buffer[sizeof(class_type)];
+                const auto dummy_obj = reinterpret_cast<class_type*>(dummy_buffer);
 
-            const int required_length = WideCharToMultiByte(
-                CP_UTF8, // CodePage
-                0,       // dwFlags
-                &data[0],
-                static_cast<int>(data.size()),
-                nullptr,
-                0,
-                nullptr,
-                nullptr);
+                const std::ptrdiff_t offset = reinterpret_cast<char*>(&(dummy_obj->*member_ptr)) - reinterpret_cast<char*>(dummy_obj);
+                return reinterpret_cast<class_type*>(reinterpret_cast<char*>(field_addr) - offset);
+            }
 
-            std::string result = {};
-            result.resize(required_length);
-            WideCharToMultiByte(
-                CP_UTF8,
-                0,
-                &data[0],
-                static_cast<int>(data.size()),
-                &result[0],
-                required_length,
-                nullptr,
-                nullptr);
+            inline auto image_first_section(image_nt_headers* nt_headers) -> image_section_header_t* {
+                if (!nt_headers) {
+                    return nullptr;
+                }
 
-            return result;
-        }
+                const auto base_address = reinterpret_cast<std::uintptr_t>(nt_headers);
+                constexpr std::ptrdiff_t optional_header_offset = offsetof(win::image_nt_headers, optional_header);
 
-        inline auto str_to_wstr(const std::string& data) -> std::wstring {
-            if (data.empty())
-                return {};
+                const std::uintptr_t section_headers = base_address + optional_header_offset + nt_headers->file_header.size_of_optional_header;
+                return reinterpret_cast<image_section_header_t*>(section_headers);
+            }
 
-             const int required_length = MultiByteToWideChar(
-                CP_UTF8,
-                0,
-                &data[0],
-                static_cast<int>(data.size()),
-                nullptr,
-                NULL);
+            inline auto rva_to_raw(const std::uint32_t rva, image_nt_headers* nt_headers) -> std::uint32_t {
+                image_section_header_t* sections = image_first_section(nt_headers);
+                for (std::uint32_t idx = 0; idx < nt_headers->file_header.number_of_sections; ++idx) {
+                    image_section_header_t* section = &sections[idx];
+                    if (rva >= section->virtual_address && rva < section->virtual_address + section->misc.virtual_size)
+                        return rva - section->virtual_address + section->pointer_to_raw_data;
+                }
 
-            std::wstring result = {};
-            result.resize(required_length);
-            MultiByteToWideChar(
-                CP_UTF8,
-                0,
-                &data[0],
-                static_cast<int>(data.size()),
-                &result[0],
-                required_length);
+                return rva;
+            }
+        } // namespace win
 
-            return result;
-        }
+        namespace str_transform {
+            inline auto wstr_to_str(const std::wstring& data) -> std::string {
+                if (data.empty())
+                    return {};
 
-        inline auto str_to_wstr(const std::string_view data) -> std::wstring {
-            if (data.empty())
-                return {};
+                const int required_length = WideCharToMultiByte(
+                    CP_UTF8,
+                    0,
+                    &data[0],
+                    static_cast<int>(data.size()),
+                    nullptr,
+                    0,
+                    nullptr,
+                    nullptr);
 
-            const int required_length = MultiByteToWideChar(
-                CP_UTF8,
-                0,
-                &data[0],
-                static_cast<int>(data.size()),
-                nullptr,
-                NULL);
+                std::string result = {};
+                result.resize(required_length);
+                WideCharToMultiByte(
+                    CP_UTF8,
+                    0,
+                    &data[0],
+                    static_cast<int>(data.size()),
+                    &result[0],
+                    required_length,
+                    nullptr,
+                    nullptr);
 
-            std::wstring result = {};
-            result.resize(required_length);
-            MultiByteToWideChar(
-                CP_UTF8,
-                0,
-                &data[0],
-                static_cast<int>(data.size()),
-                &result[0],
-                required_length);
+                return result;
+            }
 
-            return result;
-        }
+            inline auto wstr_to_str(const std::wstring_view data) -> std::string {
+                if (data.empty())
+                    return {};
 
-        struct module_info_t {
-            address_t base;
-            hash::fnv1a64_t name;
-            hash::fnv1a64_t trimmed_nama;
-            std::string path;
-        };
+                const int required_length = WideCharToMultiByte(
+                    CP_UTF8,
+                    0,
+                    &data[0],
+                    static_cast<int>(data.size()),
+                    nullptr,
+                    0,
+                    nullptr,
+                    nullptr);
 
-        namespace view
-        {
+                std::string result = {};
+                result.resize(required_length);
+                WideCharToMultiByte(
+                    CP_UTF8,
+                    0,
+                    &data[0],
+                    static_cast<int>(data.size()),
+                    &result[0],
+                    required_length,
+                    nullptr,
+                    nullptr);
+
+                return result;
+            }
+        } // namespace str_transform
+        namespace view {
             class module_view_t {
-            public:
+              public:
+                struct module_info_t {
+                    address_t base;
+                    hash::fnv1a64_t name;
+                    hash::fnv1a64_t trimmed_nama;
+                    std::string path;
+                };
+
                 module_view_t() {
                     _head = &get_peb()->ldr->in_load_order_module_list;
                 }
@@ -423,7 +437,7 @@ namespace shadow {
                 }
 
                 class iterator {
-                public:
+                  public:
                     using iterator_category = std::bidirectional_iterator_tag;
                     using value_type = module_info_t;
                     using difference_type = std::ptrdiff_t;
@@ -478,7 +492,7 @@ namespace shadow {
                         return _current != other._current;
                     }
 
-                private:
+                  private:
                     mutable module_info_t _module_info;
                     win::list_entry_t* _current = nullptr;
                     win::list_entry_t* _head = nullptr;
@@ -487,19 +501,18 @@ namespace shadow {
                         if (_current == _head)
                             return;
 
-                        const win::ldr_data_table_entry_t* table_entry = CONTAINING_RECORD(
+                        const win::ldr_data_table_entry_t* table_entry = win::containing_record(
                             _current,
-                            win::ldr_data_table_entry_t,
-                            in_load_order_links);
+                            &win::ldr_data_table_entry_t::in_load_order_links);
 
                         _module_info.base = table_entry->dll_base;
 
                         if (table_entry->full_dll_name.buffer && table_entry->full_dll_name.length > 0)
-                            _module_info.path = wstr_to_str(
+                            _module_info.path = str_transform::wstr_to_str(
                                 std::wstring_view(table_entry->full_dll_name.buffer));
 
                         if (table_entry->base_dll_name.buffer && table_entry->base_dll_name.length > 0) {
-                            std::string module_name = wstr_to_str(
+                            std::string module_name = str_transform::wstr_to_str(
                                 std::wstring_view(table_entry->base_dll_name.buffer));
 
                             std::ranges::transform(module_name, module_name.begin(), ::tolower);
@@ -531,7 +544,7 @@ namespace shadow {
                     return std::ranges::find_if(begin(), end(), predicate);
                 }
 
-            private:
+              private:
                 win::list_entry_t* _head;
 
                 [[nodiscard]] static auto get_peb() -> win::peb_t* {
@@ -539,15 +552,15 @@ namespace shadow {
                 }
             };
 
-            struct export_info_t {
-                hash::fnv1a64_t name;
-                address_t address;
-                std::uint16_t ordinal;
-                bool is_forwarded;
-            };
-
             class export_view_t {
-            public:
+              public:
+                struct export_info_t {
+                    hash::fnv1a64_t name;
+                    address_t address;
+                    std::uint16_t ordinal;
+                    bool is_forwarded;
+                };
+
                 export_view_t(const address_t& module_base)
                     : _module_base(module_base) {
                 }
@@ -588,7 +601,7 @@ namespace shadow {
                 }
 
                 class iterator {
-                public:
+                  public:
                     using iterator_category = std::bidirectional_iterator_tag;
                     using value_type = export_info_t;
                     using difference_type = std::ptrdiff_t;
@@ -651,7 +664,7 @@ namespace shadow {
                         return _current != other._current || _export_view != other._export_view;
                     }
 
-                private:
+                  private:
                     mutable export_info_t _export_info{};
                     const export_view_t* _export_view = nullptr;
                     std::uint32_t _current = 0;
@@ -692,7 +705,7 @@ namespace shadow {
                     return std::ranges::find_if(begin(), end(), predicate);
                 }
 
-            private:
+              private:
                 address_t _module_base;
 
                 [[nodiscard]] auto export_directory() const -> win::image_export_directory_t* {
@@ -711,104 +724,89 @@ namespace shadow {
                     return const_cast<win::image_data_directory_t*>(&optional_header->export_directory);
                 }
             };
-        }
+        } // namespace view
 
-        struct forwarded_string_t {
-            hash::fnv1a64_t dll_name;
-            hash::fnv1a64_t proc_name;
-            std::uint16_t ordinal;
-            bool by_ordinal = false;
-        };
+        namespace apicalls {
+            struct forwarded_string_t {
+                hash::fnv1a64_t module_name;
+                hash::fnv1a64_t proc_name;
+                std::uint16_t ordinal;
+                bool by_ordinal = false;
+            };
 
-        inline auto resolve_forwarded_string(const address_t& export_address) -> forwarded_string_t {
-            const std::string_view forward_string = export_address.as<const char*>();
+            inline auto resolve_forwarded_string(const address_t& export_address) -> forwarded_string_t {
+                const std::string_view forward_string = export_address.as<const char*>();
 
-            const std::size_t dot_delimiter = forward_string.find_first_of('.');
+                const std::size_t dot_delimiter = forward_string.find_first_of('.');
 
-            std::string trimmed_dll(forward_string.substr(0, dot_delimiter));
-            std::ranges::transform(trimmed_dll, trimmed_dll.begin(), ::tolower);
+                std::string trimmed_name(forward_string.substr(0, dot_delimiter));
+                std::ranges::transform(trimmed_name, trimmed_name.begin(), ::tolower);
 
-            if (forward_string[dot_delimiter + 1] == '#') {
-                const std::string_view ordinal_str = forward_string.substr(dot_delimiter + 2);
+                if (forward_string[dot_delimiter + 1] == '#') {
+                    const std::string_view ordinal_str = forward_string.substr(dot_delimiter + 2);
 
-                std::uint16_t ordinal = 0;
-                for (char c : ordinal_str) {
-                    if (c >= '0' && c <= '9')
-                        ordinal = ordinal * 10 + (c - '0');
-                    else
-                        break;
+                    std::uint16_t ordinal = 0;
+                    for (char c : ordinal_str) {
+                        if (c >= '0' && c <= '9')
+                            ordinal = ordinal * 10 + (c - '0');
+                        else
+                            break;
+                    }
+
+                    return {
+                        .module_name = hash::fnv1a64(trimmed_name),
+                        .proc_name = 0,
+                        .ordinal = ordinal,
+                        .by_ordinal = true};
                 }
 
+                std::string_view proc_name = forward_string.substr(dot_delimiter + 1);
                 return {
-                    .dll_name = hash::fnv1a64(trimmed_dll),
-                    .proc_name = 0,
-                    .ordinal = ordinal,
-                    .by_ordinal = true};
+                    .module_name = hash::fnv1a64(trimmed_name),
+                    .proc_name = hash::fnv1a64(proc_name),
+                    .ordinal = 0};
             }
 
-            std::string_view proc_name = forward_string.substr(dot_delimiter + 1);
-            return {
-                .dll_name = hash::fnv1a64(trimmed_dll),
-                .proc_name = hash::fnv1a64(proc_name),
-                .ordinal = 0};
-        }
-
-        inline auto resolve_forwarded_export(const view::module_view_t& module_view, const address_t& forwarded_address) -> address_t {
-            forwarded_string_t forwarded_string = resolve_forwarded_string(forwarded_address);
-            const auto forward_module = module_view.find_if([&forwarded_string](const module_info_t& m) -> bool {
-                return m.trimmed_nama == forwarded_string.dll_name;
-            });
-
-            if (forward_module == module_view.end())
-                return {};
-
-            const view::export_view_t e_view{forward_module->base};
-            if (forwarded_string.by_ordinal) {
-                const auto _export = e_view.find_if([&forwarded_string](const view::export_info_t& e) -> bool {
-                    return e.ordinal == forwarded_string.ordinal;
+            inline auto resolve_forwarded_export(const view::module_view_t& module_view, const address_t& forwarded_address) -> address_t {
+                forwarded_string_t forwarded_string = resolve_forwarded_string(forwarded_address);
+                const auto forward_module = module_view.find_if([&forwarded_string](const view::module_view_t::module_info_t& m) -> bool {
+                    return m.trimmed_nama == forwarded_string.module_name;
                 });
 
+                if (forward_module == module_view.end())
+                    return {};
+
+                const view::export_view_t e_view{forward_module->base};
+                if (forwarded_string.by_ordinal) {
+                    const auto _export = e_view.find_if([&forwarded_string](const view::export_view_t::export_info_t& e) -> bool {
+                        return e.ordinal == forwarded_string.ordinal;
+                    });
+
+                    if (_export == e_view.end())
+                        return {};
+
+                    return _export->address;
+                }
+
+                const auto _export = e_view.find(forwarded_string.proc_name);
                 if (_export == e_view.end())
                     return {};
 
                 return _export->address;
             }
 
-            const auto _export = e_view.find(forwarded_string.proc_name);
-            if (_export == e_view.end())
-                return {};
+            inline auto find_export_by_name(const hash::fnv1a64_t module_name, const hash::fnv1a64_t export_name) -> address_t {
+                view::module_view_t m_view;
+                m_view.skip_module();
 
-            return _export->address;
-        }
+                const auto module = m_view.find(module_name);
+                if (module == m_view.end())
+                    return {};
 
-        inline auto find_export_by_name(const hash::fnv1a64_t module_name, const hash::fnv1a64_t export_name) -> address_t {
-            view::module_view_t m_view;
-            m_view.skip_module();
-
-            const auto module = m_view.find(module_name);
-            if (module == m_view.end())
-                return {};
-
-            const view::export_view_t e_view{module->base};
-            const auto _export = e_view.find(export_name);
-            if (_export == e_view.end())
-                return {};
-
-            if (_export->is_forwarded)
-                return resolve_forwarded_export(m_view, _export->address);
-
-            return _export->address;
-        }
-
-        inline auto find_export_by_name(const hash::fnv1a64_t export_name) -> address_t {
-            view::module_view_t m_view;
-            m_view.skip_module();
-
-            for (const auto& m : m_view) {
-                const view::export_view_t e_view{m.base};
+                const view::export_view_t e_view{module->base};
                 const auto _export = e_view.find(export_name);
                 if (_export == e_view.end())
-                    continue;
+                    return {};
 
                 if (_export->is_forwarded)
                     return resolve_forwarded_export(m_view, _export->address);
@@ -816,30 +814,47 @@ namespace shadow {
                 return _export->address;
             }
 
-            return {};
-        }
+            inline auto find_export_by_name(const hash::fnv1a64_t export_name) -> address_t {
+                view::module_view_t m_view;
+                m_view.skip_module();
 
-        inline auto find_export_by_ordinal(const hash::fnv1a64_t module_name, const std::uint16_t ordinal) -> address_t {
-            view::module_view_t m_view;
-            m_view.skip_module();
+                for (const auto& m : m_view) {
+                    const view::export_view_t e_view{m.base};
+                    const auto _export = e_view.find(export_name);
+                    if (_export == e_view.end())
+                        continue;
 
-            const auto module = m_view.find(module_name);
-            if (module == m_view.end())
+                    if (_export->is_forwarded)
+                        return resolve_forwarded_export(m_view, _export->address);
+
+                    return _export->address;
+                }
+
                 return {};
+            }
 
-            const view::export_view_t e_view{module->base};
-            const auto _export = e_view.find_if([&ordinal](const view::export_info_t& e) -> bool {
-                return e.ordinal == ordinal;
-            });
+            inline auto find_export_by_ordinal(const hash::fnv1a64_t module_name, const std::uint16_t ordinal) -> address_t {
+                view::module_view_t m_view;
+                m_view.skip_module();
 
-            if (_export == e_view.end())
-                return {};
+                const auto module = m_view.find(module_name);
+                if (module == m_view.end())
+                    return {};
 
-            if (_export->is_forwarded)
-                return resolve_forwarded_export(m_view, _export->address);
+                const view::export_view_t e_view{module->base};
+                const auto _export = e_view.find_if([&ordinal](const view::export_view_t::export_info_t& e) -> bool {
+                    return e.ordinal == ordinal;
+                });
 
-            return _export->address;
-        }
+                if (_export == e_view.end())
+                    return {};
+
+                if (_export->is_forwarded)
+                    return resolve_forwarded_export(m_view, _export->address);
+
+                return _export->address;
+            }
+        } // namespace apicalls
 
         template <typename T>
         auto normalize_arg(T arg) {
@@ -857,10 +872,10 @@ namespace shadow {
     } // namespace detail
 
     template <typename Ret = void, typename... Args>
-    __declspec(noinline) auto call(detail::hash::fnv1a64_t module_name, detail::hash::fnv1a64_t proc_name, Args... args) -> Ret {
+    __declspec(noinline) auto call(const detail::hash::fnv1a64_t module_name, const detail::hash::fnv1a64_t proc_name, Args&&... args) -> Ret {
         using namespace detail;
 
-        const address_t proc = find_export_by_name(module_name, proc_name);
+        const address_t proc = apicalls::find_export_by_name(module_name, proc_name);
         if (!proc) {
             if constexpr (std::is_same_v<Ret, void>)
                 return;
@@ -875,10 +890,10 @@ namespace shadow {
     }
 
     template <typename Ret = void, typename... Args>
-    __declspec(noinline) auto call(detail::hash::fnv1a64_t proc_name, Args... args) -> Ret {
+    __declspec(noinline) auto call(const detail::hash::fnv1a64_t proc_name, Args&&... args) -> Ret {
         using namespace detail;
 
-        const address_t proc = find_export_by_name(proc_name);
+        const address_t proc = apicalls::find_export_by_name(proc_name);
         if (!proc) {
             if constexpr (std::is_same_v<Ret, void>)
                 return;
@@ -893,10 +908,10 @@ namespace shadow {
     }
 
     template <typename Ret = void, typename... Args>
-    __declspec(noinline) auto call(detail::hash::fnv1a64_t module_name, std::uint16_t ordinal, Args... args) -> Ret {
+    __declspec(noinline) auto call(const detail::hash::fnv1a64_t module_name, std::uint16_t ordinal, Args&&... args) -> Ret {
         using namespace detail;
 
-        const address_t proc = find_export_by_ordinal(module_name, ordinal);
+        const address_t proc = apicalls::find_export_by_ordinal(module_name, ordinal);
         if (!proc) {
             if constexpr (std::is_same_v<Ret, void>)
                 return;
@@ -905,6 +920,178 @@ namespace shadow {
         }
 
         using fn_t = Ret (*)(decltype(normalize_arg(std::forward<Args>(args)))...);
+        const fn_t fn = proc.as<fn_t>();
+
+        return fn(normalize_arg(std::forward<Args>(args))...);
+    }
+
+    namespace detail::syscalls {
+        struct syscall_t {
+            std::uint32_t number;
+            std::uintptr_t start_offset;
+        };
+
+        constexpr std::uint8_t kSyscallStub[] = {
+            0x4C, 0x8B, 0xD1,             // mov r10, rcx
+            0xB8, 0x00, 0x00, 0x00, 0x00, // mov eax, <syscall_number>
+            0x0F, 0x05,                   // syscall
+            0xC3,                         // retn
+        };
+
+        constexpr std::size_t kSyscallStubSize = sizeof(kSyscallStub);
+        constexpr std::ptrdiff_t kSyscallStubOffsetToNumber = 0x4;
+        constexpr std::uint32_t kSyscallSignature = 0xB8D18B4C;
+
+        inline bool _initialized = false;
+        inline std::unordered_map<hash::fnv1a64_t, syscall_t> _syscall_map;
+        inline address_t _syscall_region = nullptr;
+
+        inline auto parse_syscalls() -> bool {
+            view::module_view_t m_view;
+            m_view.skip_module();
+
+            const auto ntdll = m_view.find(hash::fnv1a64("ntdll.dll"));
+            if (ntdll == m_view.end())
+                return false;
+
+            const std::string_view ntdll_path = ntdll->path;
+            std::ifstream ntdll_file(ntdll_path.data(), std::ios::binary);
+            if (!ntdll_file.is_open())
+                return false;
+
+            const std::vector<std::uint8_t> ntdll_bytes((std::istreambuf_iterator(ntdll_file)), std::istreambuf_iterator<char>());
+            ntdll_file.close();
+
+            const address_t ntdll_base = ntdll_bytes.data();
+            const auto dos_header = ntdll_base.as<win::image_dos_header_t*>();
+            const auto nt_headers = ntdll_base.offset<win::image_nt_headers*>(dos_header->e_lfanew);
+            const auto optional_header = &nt_headers->optional_header;
+
+            const auto export_directory = ntdll_base.offset<win::image_export_directory_t*>(rva_to_raw(
+                optional_header->export_directory.virtual_address, nt_headers));
+
+            const auto functions_rva = ntdll_base.offset<std::uint32_t*>(rva_to_raw(
+                export_directory->address_of_functions, nt_headers));
+            const auto names_rva = ntdll_base.offset<std::uint32_t*>(rva_to_raw(
+                export_directory->address_of_names, nt_headers));
+            const auto ordinals_rva = ntdll_base.offset<std::uint16_t*>(rva_to_raw(
+                export_directory->address_of_name_ordinals, nt_headers));
+
+            for (std::uint32_t idx = 0; idx < export_directory->number_of_names; ++idx) {
+                const std::uint16_t ordinal = ordinals_rva[idx];
+                address_t function_addr = ntdll_base.offset(rva_to_raw(
+                    functions_rva[ordinal], nt_headers));
+
+                if (*function_addr.as<std::uint32_t*>() != kSyscallSignature)
+                    continue;
+
+                const std::string_view syscall_name = ntdll_base.offset<const char*>(rva_to_raw(names_rva[idx], nt_headers));
+                const std::uint32_t syscall_number = *function_addr.offset<std::uint32_t*>(kSyscallStubOffsetToNumber);
+
+                syscall_t entry = {};
+                entry.number = syscall_number;
+                entry.start_offset = _syscall_map.size() * kSyscallStubSize;
+
+                _syscall_map.emplace(hash::fnv1a64(syscall_name), entry);
+            }
+
+            return true;
+        }
+
+        inline auto allocate_syscalls() -> bool {
+            if (!parse_syscalls() || _syscall_map.empty())
+                return false;
+
+            const std::size_t allocation_size = _syscall_map.size() * kSyscallStubSize;
+
+            std::vector<std::uint8_t> syscall_buffer{};
+            syscall_buffer.resize(allocation_size);
+            for (const auto& [_, entry] : _syscall_map) {
+                std::memcpy(syscall_buffer.data() + entry.start_offset, kSyscallStub, kSyscallStubSize);
+                *reinterpret_cast<std::uint32_t*>(syscall_buffer.data() + entry.start_offset + kSyscallStubOffsetToNumber) = entry.number;
+            }
+
+            void* section_handle = nullptr;
+            win::large_integer_t section_size{};
+            section_size.quad_part = static_cast<std::int64_t>(allocation_size);
+            auto status = call<std::int32_t>(hash::fnv1a64("ntdll.dll"), hash::fnv1a64("NtCreateSection"),
+                                             &section_handle,
+                                             win::kSectionAllAccess,
+                                             nullptr,
+                                             &section_size,
+                                             win::kPageExecuteReadWrite,
+                                             win::kSecCommit | win::kSecNoChange,
+                                             nullptr);
+
+            if (status < 0)
+                return false;
+
+            void* temp_view = nullptr;
+            std::size_t view_size = allocation_size;
+            status = call<std::int32_t>(hash::fnv1a64("ntdll.dll"), hash::fnv1a64("NtMapViewOfSection"),
+                                        section_handle,
+                                        -1,
+                                        &temp_view,
+                                        0,
+                                        0,
+                                        nullptr,
+                                        &view_size,
+                                        win::eSectionInherit::kViewShare,
+                                        0,
+                                        win::kPageReadWrite);
+
+            if (status < 0)
+                return false;
+
+            std::memcpy(temp_view, syscall_buffer.data(), allocation_size);
+
+            status = call<std::int32_t>(hash::fnv1a64("ntdll.dll"), hash::fnv1a64("NtUnmapViewOfSection"),
+                                        -1,
+                                        temp_view);
+
+            if (status < 0) {
+                call(hash::fnv1a64("ntdll.dll"), hash::fnv1a64("NtClose"), section_handle);
+                return false;
+            }
+
+            void* region_address = nullptr;
+            view_size = allocation_size;
+            status = call<std::int32_t>(hash::fnv1a64("ntdll.dll"), hash::fnv1a64("NtMapViewOfSection"),
+                                        section_handle,
+                                        -1,
+                                        &region_address,
+                                        0,
+                                        0,
+                                        nullptr,
+                                        &view_size,
+                                        win::eSectionInherit::kViewShare,
+                                        0,
+                                        win::kPageExecuteRead);
+
+            call(hash::fnv1a64("ntdll.dll"), hash::fnv1a64("NtClose"), section_handle);
+
+            if (status < 0 || !region_address)
+                return false;
+
+            _syscall_region = region_address;
+            return true;
+        }
+    } // namespace detail::syscalls
+
+    template <typename... Args>
+    __declspec(noinline) auto syscall(const detail::hash::fnv1a64_t syscall_name, Args&&... args) -> std::int32_t {
+        using namespace detail;
+
+        if (!syscalls::_initialized)
+            syscalls::_initialized = syscalls::allocate_syscalls();
+
+        const auto syscall_entry = syscalls::_syscall_map.find(syscall_name);
+        if (syscall_entry == syscalls::_syscall_map.end())
+            return {};
+
+        const address_t proc = syscalls::_syscall_region.offset(syscall_entry->second.start_offset);
+
+        using fn_t = std::int32_t (*)(decltype(normalize_arg(std::forward<Args>(args)))...);
         const fn_t fn = proc.as<fn_t>();
 
         return fn(normalize_arg(std::forward<Args>(args))...);
