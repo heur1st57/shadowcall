@@ -127,6 +127,18 @@ namespace shadow {
         } // namespace hash
 
         namespace win {
+            constexpr std::int32_t kSectionAllAccess = 0x000F001F;
+            constexpr std::int32_t kPageExecuteReadWrite = 0x40;
+            constexpr std::int32_t kSecCommit = 0x08000000;
+            constexpr std::int32_t kPageReadWrite = 0x4;
+            constexpr std::int32_t kSecNoChange = 0x00400000;
+            constexpr std::int32_t kPageExecuteRead = 0x20;
+
+            enum class eSectionInherit {
+                kViewShare = 1,
+                kViewUnmap = 2
+            };
+
             struct list_entry_t {
                 list_entry_t* flink;
                 list_entry_t* blink;
@@ -310,18 +322,6 @@ namespace shadow {
                 };
             };
 
-            constexpr std::int32_t kSectionAllAccess = 0x000F001F;
-            constexpr std::int32_t kPageExecuteReadWrite = 0x40;
-            constexpr std::int32_t kSecCommit = 0x08000000;
-            constexpr std::int32_t kPageReadWrite = 0x4;
-            constexpr std::int32_t kSecNoChange = 0x00400000;
-            constexpr std::int32_t kPageExecuteRead = 0x20;
-
-            enum class eSectionInherit {
-                kViewShare = 1,
-                kViewUnmap = 2
-            };
-
             template <typename class_type, typename field_type>
             auto containing_record(field_type* field_addr, field_type class_type::* member_ptr) -> class_type* {
                 if (!field_addr) {
@@ -374,7 +374,7 @@ namespace shadow {
                     nullptr,
                     nullptr);
 
-                std::string result = {};
+                std::string result{};
                 result.resize(required_length);
                 WideCharToMultiByte(
                     CP_UTF8,
@@ -403,7 +403,7 @@ namespace shadow {
                     nullptr,
                     nullptr);
 
-                std::string result = {};
+                std::string result{};
                 result.resize(required_length);
                 WideCharToMultiByte(
                     CP_UTF8,
@@ -417,7 +417,64 @@ namespace shadow {
 
                 return result;
             }
+
+            inline auto to_lower (const std::string& data) -> std::string {
+                std::string result{};
+                result.resize (data.size());
+
+                for (std::size_t idx = 0; idx < data.size(); ++idx) {
+                    char c = data[idx];
+                    if (c >= 0x41 && c <= 0x5A)
+                        c ^= 0x20;
+
+                    result[idx] = c;
+                }
+
+                return result;
+            }
+
+            inline auto to_lower (const std::string_view data) -> std::string {
+                std::string result{};
+                result.resize (data.size());
+
+                for (std::size_t idx = 0; idx < data.size(); ++idx) {
+                    char c = data[idx];
+                    if (c >= 0x41 && c <= 0x5A)
+                        c ^= 0x20;
+
+                    result[idx] = c;
+                }
+
+                return result;
+            }
+
+            template<std::integral Ret>
+            auto extract_number (const std::string& data) -> Ret {
+                Ret result = 0;
+                for (char c : data) {
+                    if (c >= '0' && c <= '9')
+                        result = result * 10 + (c - '0');
+                    else
+                        break;
+                }
+
+                return result;
+            }
+
+            template<std::integral Ret>
+            auto extract_number (const std::string_view data) -> Ret {
+                Ret result = 0;
+                for (char c : data) {
+                    if (c >= '0' && c <= '9')
+                        result = result * 10 + (c - '0');
+                    else
+                        break;
+                }
+
+                return result;
+            }
         } // namespace str_transform
+
         namespace view {
             class module_view_t {
               public:
@@ -515,7 +572,7 @@ namespace shadow {
                             std::string module_name = str_transform::wstr_to_str(
                                 std::wstring_view(table_entry->base_dll_name.buffer));
 
-                            std::ranges::transform(module_name, module_name.begin(), ::tolower);
+                            module_name = str_transform::to_lower(module_name);
 
                             _module_info.name = hash::fnv1a64(module_name);
 
@@ -740,18 +797,12 @@ namespace shadow {
                 const std::size_t dot_delimiter = forward_string.find_first_of('.');
 
                 std::string trimmed_name(forward_string.substr(0, dot_delimiter));
-                std::ranges::transform(trimmed_name, trimmed_name.begin(), ::tolower);
+                trimmed_name = str_transform::to_lower(trimmed_name);
 
                 if (forward_string[dot_delimiter + 1] == '#') {
                     const std::string_view ordinal_str = forward_string.substr(dot_delimiter + 2);
 
-                    std::uint16_t ordinal = 0;
-                    for (char c : ordinal_str) {
-                        if (c >= '0' && c <= '9')
-                            ordinal = ordinal * 10 + (c - '0');
-                        else
-                            break;
-                    }
+                    const auto ordinal = str_transform::extract_number<std::uint16_t>(ordinal_str);
 
                     return {
                         .module_name = hash::fnv1a64(trimmed_name),
@@ -760,7 +811,7 @@ namespace shadow {
                         .by_ordinal = true};
                 }
 
-                std::string_view proc_name = forward_string.substr(dot_delimiter + 1);
+                const std::string_view proc_name = forward_string.substr(dot_delimiter + 1);
                 return {
                     .module_name = hash::fnv1a64(trimmed_name),
                     .proc_name = hash::fnv1a64(proc_name),
@@ -926,11 +977,6 @@ namespace shadow {
     }
 
     namespace detail::syscalls {
-        struct syscall_t {
-            std::uint32_t number;
-            std::uintptr_t start_offset;
-        };
-
         constexpr std::uint8_t kSyscallStub[] = {
             0x4C, 0x8B, 0xD1,             // mov r10, rcx
             0xB8, 0x00, 0x00, 0x00, 0x00, // mov eax, <syscall_number>
@@ -941,6 +987,11 @@ namespace shadow {
         constexpr std::size_t kSyscallStubSize = sizeof(kSyscallStub);
         constexpr std::ptrdiff_t kSyscallStubOffsetToNumber = 0x4;
         constexpr std::uint32_t kSyscallSignature = 0xB8D18B4C;
+
+        struct syscall_t {
+            std::uint32_t number;
+            std::uintptr_t start_offset;
+        };
 
         inline bool _initialized = false;
         inline std::unordered_map<hash::fnv1a64_t, syscall_t> _syscall_map;
