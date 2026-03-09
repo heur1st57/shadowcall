@@ -646,7 +646,7 @@ namespace shadow {
                     const win::image_export_directory_t* export_dir = export_directory ();
                     const auto ordinal_table = _module_base.offset<std::uint16_t*> (export_dir->address_of_name_ordinals);
 
-                    return ordinal_table [idx];
+                    return export_dir->base + ordinal_table [idx];
                 }
 
                 [[nodiscard]] auto is_forwarded (const address_t& export_address) const -> bool {
