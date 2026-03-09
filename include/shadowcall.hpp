@@ -348,9 +348,9 @@ namespace shadow {
             }
 
             inline auto rva_to_raw (const std::uint32_t rva, image_nt_headers* nt_headers) -> std::uint32_t {
-                image_section_header_t* sections = image_first_section (nt_headers);
+                const image_section_header_t* sections = image_first_section (nt_headers);
                 for (std::uint32_t idx = 0; idx < nt_headers->file_header.number_of_sections; ++idx) {
-                    image_section_header_t* section = &sections [idx];
+                    const image_section_header_t* section = &sections [idx];
                     if (rva >= section->virtual_address && rva < section->virtual_address + section->misc.virtual_size)
                         return rva - section->virtual_address + section->pointer_to_raw_data;
                 }
@@ -646,7 +646,7 @@ namespace shadow {
                     const win::image_export_directory_t* export_dir = export_directory ();
                     const auto ordinal_table = _module_base.offset<std::uint16_t*> (export_dir->address_of_name_ordinals);
 
-                    return ordinal_table [idx];
+                    return export_dir->base + ordinal_table [idx];
                 }
 
                 [[nodiscard]] auto is_forwarded (const address_t& export_address) const -> bool {
